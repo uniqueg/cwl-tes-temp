@@ -8,6 +8,7 @@ import signal
 import sys
 import logging
 import ftplib
+import jwt
 import uuid
 from typing import MutableMapping, MutableSequence
 from typing_extensions import Text
@@ -37,6 +38,9 @@ console = logging.StreamHandler()
 log.addHandler(console)
 
 DEFAULT_TMP_PREFIX = "tmp"
+ELIXIR_AAI_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyUt09EkKGW30jpggX1PYqrxuUw4Fo7a/uMiNvmy8CwBLfo+BgaI35Qi+ke/Dz9784CmNXjlIzNPFq+DUi+8pBDGAJ5hznfEoQI2TDzdiG7uIART4AEpLo9xCKrL1al37jrDmvgk98gbumnHsWKQb7KFRKHpIBvNVQ6v+z3nOQZ+fl1552S750ZSIfTXWXqlZohLVE9K8JwsM9i9z7h5EBU2cJkxPbFoZEs6zGMFEOohiAA99Nm7cW/3m3dCn+Nm5TJadEt/xR08b2GXhcg+tAC7qoBthpDFnUOrLbwvNWQIyE+Mch+z4+5LVTfElOGRem2tZaqYcMG/mY6EBra8pUwIDAQAB
+-----END PUBLIC KEY-----"""
 
 
 def versionstring():
@@ -49,25 +53,14 @@ def versionstring():
     return "%s %s with cwltool %s" % (sys.argv[0], __version__, cwltool_ver)
 
 
-def ftp_upload(base_url, fs_access, cwl_obj):
-    # type: (Text, FtpFsAccess, Dict[Text, Any]) -> None
-    """
-    Upload a File or Directory to the given FTP URL;
-
-    Update the location URL to match.
-    """
-    if "path" not in cwl_obj and not (
-            "location" in cwl_obj and cwl_obj["location"].startswith(
+def ftp_upload(base_url, fs_access, cwl_file):
+    """Upload a File to the given FTP URL; update the location URL to match."""
+    if "path" not in cwl_file and not (
+            "location" in cwl_file and cwl_file["location"].startswith(
                 "file:/")):
         return
-    path = cwl_obj.get("path", cwl_obj["location"][6:])
-    is_dir = os.path.isdir(path)
+    path = cwl_file.get("path", cwl_file["location"][6:])
     basename = os.path.basename(path)
-    dirname = os.path.dirname(path)
-    if is_dir and cwl_obj["class"] != "Directory":
-        raise ValueError("Passed a directory but Class is not Directory")
-    if not is_dir and cwl_obj["class"] != "File":
-        raise ValueError("Passed a file but Class is not File")
     try:
         fs_access.mkdir(base_url)
     except ftplib.all_errors:
@@ -75,26 +68,13 @@ def ftp_upload(base_url, fs_access, cwl_obj):
     if not fs_access.isdir(base_url):
         raise Exception(
             'Failed to create target directory "{}".'.format(base_url))
-    cwl_obj["location"] = base_url + '/' + basename
-    cwl_obj.pop("path", None)
-    if is_dir:
-        if fs_access.isdir(fs_access.join(base_url, basename)):
-            log.warning("FTP upload, Directory %s already exists", basename)
-        else:
-            for root, _subdirs, files in os.walk(path, followlinks=True):
-                root_path = base_url + '/' + root[len(dirname):]
-                fs_access.mkdir(root_path)
-                for each_file in files:
-                    with open(os.path.join(root,
-                                           each_file), mode="rb") as source:
-                        fs_access.upload(source, root_path + '/' + each_file)
-        cwl_obj.pop("listing", None)
+    cwl_file["location"] = base_url + '/' + basename
+    cwl_file.pop("path", None)
+    if fs_access.isfile(fs_access.join(base_url, basename)):
+        log.warning("FTP upload, file %s already exists", basename)
     else:
-        if fs_access.isfile(fs_access.join(base_url, basename)):
-            log.warning("FTP upload, file %s already exists", basename)
-        else:
-            with open(path, mode="rb") as source:
-                fs_access.upload(source, cwl_obj["location"])
+        with open(path, mode="rb") as source:
+            fs_access.upload(source, cwl_file["location"])
 
 
 def main(args=None):
@@ -114,6 +94,13 @@ def main(args=None):
         parser.print_usage()
         print("cwl-tes: error: argument --tes is required")
         return 1
+
+    if parsed_args.token:
+        try:
+            jwt.decode(parsed_args.token,
+                       parsed_args.token_public_key.encode('utf-8').decode('unicode_escape'), algorithms=['RS256'])
+        except Exception as e:
+            raise Exception('Token is not valid')
 
     if parsed_args.quiet:
         log.setLevel(logging.WARN)
@@ -138,6 +125,7 @@ def main(args=None):
 
     class CachingFtpFsAccess(FtpFsAccess):
         """Ensures that the FTP connection cache is shared."""
+
         def __init__(self, basedir):
             super(CachingFtpFsAccess, self).__init__(basedir, ftp_cache)
     ftp_fs_access = CachingFtpFsAccess(os.curdir)
@@ -147,16 +135,15 @@ def main(args=None):
     loading_context = cwltool.main.LoadingContext(vars(parsed_args))
     loading_context.construct_tool_object = functools.partial(
         make_tes_tool, url=parsed_args.tes,
-        remote_storage_url=parsed_args.remote_storage_url)
+        remote_storage_url=parsed_args.remote_storage_url,
+        token=parsed_args.token)
     runtime_context = cwltool.main.RuntimeContext(vars(parsed_args))
     runtime_context.make_fs_access = CachingFtpFsAccess
     runtime_context.path_mapper = functools.partial(
         TESPathMapper, fs_access=ftp_fs_access)
-    job_executor = MultithreadedJobExecutor() if parsed_args.parallel \
-        else SingleJobExecutor()
-    job_executor.max_ram = job_executor.max_cores = float("inf")
     executor = functools.partial(
-        tes_execute, job_executor=job_executor,
+        tes_execute, job_executor=MultithreadedJobExecutor()
+        if parsed_args.parallel else SingleJobExecutor(),
         loading_context=loading_context,
         remote_storage_url=parsed_args.remote_storage_url,
         ftp_access=ftp_fs_access)
@@ -181,7 +168,6 @@ def tes_execute(process,           # type: Process
                 ):  # type: (...) -> Tuple[Optional[Dict[Text, Any]], Text]
     """
     Upload to the remote_storage_url (if needed) and execute.
-
     Adapted from:
     https://github.com/curoverse/arvados/blob/2b0b06579199967eca3d44d955ad64195d2db3c3/sdk/cwl/arvados_cwl/__init__.py#L407
     """
@@ -208,7 +194,6 @@ def tes_execute(process,           # type: Process
 def upload_workflow_deps_ftp(process, remote_storage_url, ftp_access):
     """
     Ensure that all default files in this workflow are uploaded.
-
     Adapted from:
     https://github.com/curoverse/arvados/blob/2b0b06579199967eca3d44d955ad64195d2db3c3/sdk/cwl/arvados_cwl/runner.py#L292
     """
@@ -226,13 +211,11 @@ def upload_dependencies_ftp(document_loader, workflowobj, uri, loadref_run,
                             remote_storage_url, ftp_access):
     """
     Upload the dependencies of the workflowobj document to an FTP location.
-
     Does an in-place update of references in "workflowobj".
     Use scandeps to find $import, $include, $schemas, run, File and Directory
     fields that represent external references.
     If workflowobj has an "id" field, this will reload the document to ensure
     it is scanning the raw document prior to preprocessing.
-
     Adapted from:
     https://github.com/curoverse/arvados/blob/2b0b06579199967eca3d44d955ad64195d2db3c3/sdk/cwl/arvados_cwl/runner.py#L83
     """
@@ -298,11 +281,8 @@ def upload_dependencies_ftp(document_loader, workflowobj, uri, loadref_run,
         # files that need to be uploaded.
         if not entry.startswith("file:"):
             del discovered[entry]
-    visit_class(workflowobj, ("Directory"), functools.partial(
-        ftp_upload, remote_storage_url, ftp_access))
+
     visit_class(workflowobj, ("File"), functools.partial(
-        ftp_upload, remote_storage_url, ftp_access))
-    visit_class(discovered, ("Directory"), functools.partial(
         ftp_upload, remote_storage_url, ftp_access))
     visit_class(discovered, ("File"), functools.partial(
         ftp_upload, remote_storage_url, ftp_access))
@@ -311,7 +291,6 @@ def upload_dependencies_ftp(document_loader, workflowobj, uri, loadref_run,
 def find_defaults(item, operation):
     """
     Find instances of a default field and apply the given operation.
-
     Adapted from:
     https://github.com/curoverse/arvados/blob/2b0b06579199967eca3d44d955ad64195d2db3c3/sdk/cwl/arvados_cwl/runner.py#L56
     """
@@ -329,7 +308,6 @@ def find_defaults(item, operation):
 def discover_secondary_files(inputs, job_order, discovered=None):
     """
     Find secondaryFiles in the schema and transfer to the job_order.
-
     Adapted from:
     https://github.com/curoverse/arvados/blob/2b0b06579199967eca3d44d955ad64195d2db3c3/sdk/cwl/arvados_cwl/runner.py#L166
     """
@@ -343,7 +321,6 @@ def discover_secondary_files(inputs, job_order, discovered=None):
 def set_secondary(typedef, fileobj, discovered):
     """
     Pull over missing secondaryFiles to the job object entry.
-
     Adapted from:
     https://github.com/curoverse/arvados/blob/2b0b06579199967eca3d44d955ad64195d2db3c3/sdk/cwl/arvados_cwl/runner.py#L67
     """
@@ -363,7 +340,6 @@ def upload_job_order_ftp(process, job_order, remote_storage_url, ftp_access):
     """
     Upload local files referenced in the input object and return updated input
     object with 'location' updated to new URIs.
-
     Adapted from:
     https://github.com/curoverse/arvados/blob/2b0b06579199967eca3d44d955ad64195d2db3c3/sdk/cwl/arvados_cwl/runner.py#L266
     """
@@ -389,6 +365,9 @@ def arg_parser():  # type: () -> argparse.ArgumentParser
                         type=Text, default=os.path.abspath('.'),
                         help="Output directory, default current directory")
     parser.add_argument("--remote-storage-url", type=str)
+    parser.add_argument("--token", type=str)
+    parser.add_argument("--token-public-key", type=str,
+                        default=ELIXIR_AAI_PUBLIC_KEY)
     envgroup = parser.add_mutually_exclusive_group()
     envgroup.add_argument(
         "--preserve-environment",

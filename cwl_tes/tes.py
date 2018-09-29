@@ -1,5 +1,6 @@
 from __future__ import absolute_import, print_function, unicode_literals
 
+import itertools
 import logging
 import os
 import random
@@ -34,22 +35,23 @@ from .ftp import abspath
 log = logging.getLogger("tes-backend")
 
 
-def make_tes_tool(spec, loading_context, url, remote_storage_url):
+def make_tes_tool(spec, loading_context, url, remote_storage_url, token):
     """cwl-tes specific factory for CWL Process generation."""
     if "class" in spec and spec["class"] == "CommandLineTool":
         return TESCommandLineTool(
-            spec, loading_context, url, remote_storage_url)
+            spec, loading_context, url, remote_storage_url, token)
     return default_make_tool(spec, loading_context)
 
 
 class TESCommandLineTool(CommandLineTool):
     """cwl-tes specific CommandLineTool."""
 
-    def __init__(self, spec, loading_context, url, remote_storage_url):
+    def __init__(self, spec, loading_context, url, remote_storage_url, token):
         super(TESCommandLineTool, self).__init__(spec, loading_context)
         self.spec = spec
         self.url = url
         self.remote_storage_url = remote_storage_url
+        self.token = token
 
     def make_path_mapper(self, reffiles, stagedir, runtimeContext,
                          separateDirs):
@@ -68,7 +70,8 @@ class TESCommandLineTool(CommandLineTool):
             remote_storage_url = ""
         return functools.partial(TESTask, runtime_context=runtimeContext,
                                  url=self.url, spec=self.spec,
-                                 remote_storage_url=remote_storage_url)
+                                 remote_storage_url=remote_storage_url,
+                                 token=self.token)
 
 
 class TESPathMapper(PathMapper):
@@ -81,11 +84,12 @@ class TESPathMapper(PathMapper):
 
     def _download_ftp_file(self, path):
         with NamedTemporaryFile(mode='wb', delete=False) as dest:
-            with self.fs_access.open(path, mode="rb") as handle:
-                chunk = "start"
-                while chunk:
-                    chunk = handle.read(16384)
-                    dest.write(chunk)
+            handle = self.fs_access.open(path, mode="rb")
+            chunk = "start"
+            while chunk:
+                chunk = handle.read(16384)
+                dest.write(chunk)
+            handle.close()
             return dest.name
 
     def visit(self, obj, stagedir, basedir, copy=False, staged=False):
@@ -152,14 +156,18 @@ class TESTask(JobBase):
                  runtime_context,
                  url,
                  spec,
-                 remote_storage_url=None):
+                 remote_storage_url=None,
+                 token=None):
         super(TESTask, self).__init__(builder, joborder, make_path_mapper,
                                       requirements, hints, name)
         self.runtime_context = runtime_context
         self.spec = spec
         self.outputs = None
         self.inplace_update = False
-        self.basedir = runtime_context.basedir or os.getcwd()
+        if runtime_context.basedir is not None:
+            self.basedir = runtime_context.basedir
+        else:
+            self.basedir = os.getcwd()
         self.fs_access = StdFsAccess(self.basedir)
 
         self.id = None
@@ -167,18 +175,24 @@ class TESTask(JobBase):
         self.exit_code = None
         self.poll_interval = 1
         self.poll_retries = 10
-        self.client = tes.HTTPClient(url)
+        self.client = tes.HTTPClient(url, token=token)
         self.remote_storage_url = remote_storage_url
+        self.token = token
 
     def get_container(self):
-        default = self.runtime_context.default_container or "python:2.7"
+        default = "python:2.7"
         container = default
+        if self.runtime_context.default_container:
+            container = self.runtime_context.default_container
 
-        docker_req, _ = self.get_requirement("DockerRequirement")
-        if docker_req:
-                container = docker_req.get(
+        reqs = itertools.chain.from_iterable([
+            self.spec.get("requirements", []),
+            self.spec.get("hints", [])])
+        for req in reqs:
+            if req.get("class", "NA") == "DockerRequirement":
+                container = req.get(
                     "dockerPull",
-                    docker_req.get("dockerImageId", default)
+                    req.get("dockerImageId", default)
                 )
         return container
 
@@ -317,22 +331,36 @@ class TESTask(JobBase):
         )
 
         container = self.get_container()
+        cpus = None
+        ram = None
+        disk = None
 
-        res_reqs = self.builder.resources
-        ram = res_reqs['ram'] / 953.674
-        disk = (res_reqs['outdirSize'] + res_reqs['tmpdirSize']) / 953.674
-        cpus = res_reqs['cores']
+        for i in self.builder.requirements:
+            if i.get("class", "NA") == "ResourceRequirement":
+                cpus = i.get("coresMin", i.get("coresMax", None))
+                ram = i.get("ramMin", i.get("ramMax", None))
+                disk = i.get("outdirMin", i.get("outdirMax", None))
 
-        docker_req, _ = self.get_requirement("DockerRequirement")
-        if docker_req and hasattr(docker_req, "dockerOutputDirectory"):
-            output_parameters.append(
-                tes.Output(
-                    name="dockerOutputDirectory",
-                    url=self.output2url(""),
-                    path=docker_req.dockerOutputDirectory,
-                    type="DIRECTORY"
-                )
-            )
+                if (cpus is None or isinstance(cpus, str)) or \
+                   (ram is None or isinstance(ram, str)) or \
+                   (disk is None or isinstance(disk, str)):
+                    raise UnsupportedRequirement(
+                        "cwl-tes does not yet support dynamic resource "
+                        "requests"
+                    )
+
+                ram = ram / 953.674 if ram is not None else None
+                disk = disk / 953.674 if disk is not None else None
+            elif i.get("class", "NA") == "DockerRequirement":
+                if i.get("dockerOutputDirectory", None) is not None:
+                    output_parameters.append(
+                        tes.Output(
+                            name="dockerOutputDirectory",
+                            url=self.output2url(""),
+                            path=i.get("dockerOutputDirectory"),
+                            type="DIRECTORY"
+                        )
+                    )
 
         create_body = tes.Task(
             name=self.name,
@@ -429,17 +457,9 @@ class TESTask(JobBase):
                     and self.exit_code not in self.successCodes:
                 process_status = "permanentFail"
                 log.error("[job %s] job error:\n%s", self.name, self.state)
-            remote_cwl_output_json = False
-            if self.remote_storage_url:
-                remote_fs_access = runtimeContext.make_fs_access(
-                    self.remote_storage_url)
-                remote_cwl_output_json = remote_fs_access.exists(
-                    remote_fs_access.join(
-                        self.remote_storage_url, "cwl.output.json"))
             if self.remote_storage_url:
                 original_outdir = self.builder.outdir
-                if not remote_cwl_output_json:
-                    self.builder.outdir = self.remote_storage_url
+                self.builder.outdir = self.remote_storage_url
                 outputs = self.collect_outputs(self.remote_storage_url)
                 self.builder.outdir = original_outdir
             else:
