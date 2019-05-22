@@ -1,5 +1,7 @@
-cwltool==1.0.20180912090223
+cwltool>=1.0.20180912090223
 future>=0.16.0
 requests>=2.18.2
 py-tes>=0.3.0
 typing_extensions
+PyJWT==1.6.4
+git+git@github.com:ohsu-comp-bio/py-tes.git@bbfcf40e8fd254bbd7cce06636e48d76a6756d79
