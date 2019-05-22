@@ -38,9 +38,7 @@ console = logging.StreamHandler()
 log.addHandler(console)
 
 DEFAULT_TMP_PREFIX = "tmp"
-ELIXIR_AAI_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyUt09EkKGW30jpggX1PYqrxuUw4Fo7a/uMiNvmy8CwBLfo+BgaI35Qi+ke/Dz9784CmNXjlIzNPFq+DUi+8pBDGAJ5hznfEoQI2TDzdiG7uIART4AEpLo9xCKrL1al37jrDmvgk98gbumnHsWKQb7KFRKHpIBvNVQ6v+z3nOQZ+fl1552S750ZSIfTXWXqlZohLVE9K8JwsM9i9z7h5EBU2cJkxPbFoZEs6zGMFEOohiAA99Nm7cW/3m3dCn+Nm5TJadEt/xR08b2GXhcg+tAC7qoBthpDFnUOrLbwvNWQIyE+Mch+z4+5LVTfElOGRem2tZaqYcMG/mY6EBra8pUwIDAQAB
------END PUBLIC KEY-----"""
+DEFAULT_TOKEN_PUBLIC_KEY = os.environ.get('TOKEN_PUBLIC_KEY', '')
 
 
 def versionstring():
@@ -367,7 +365,7 @@ def arg_parser():  # type: () -> argparse.ArgumentParser
     parser.add_argument("--remote-storage-url", type=str)
     parser.add_argument("--token", type=str)
     parser.add_argument("--token-public-key", type=str,
-                        default=ELIXIR_AAI_PUBLIC_KEY)
+                        default=DEFAULT_TOKEN_PUBLIC_KEY)
     envgroup = parser.add_mutually_exclusive_group()
     envgroup.add_argument(
         "--preserve-environment",
